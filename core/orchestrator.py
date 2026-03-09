@@ -1,9 +1,9 @@
 """
 Immune Response Orchestrator — the central nervous system.
 Subscribes to the Redis threat channel, enriches events with detector analysis,
-then runs each threat through the sequential immune response pipeline.
+then runs each threat through a LangGraph StateGraph immune response pipeline.
 
-Pipeline: sentinel → investigator → [healer, hunter] → memory_agent
+Graph: sentinel → investigator → (conditional) → [healer →] [hunter →] memory_agent
 """
 import asyncio
 import json
@@ -12,8 +12,9 @@ from datetime import datetime
 from typing import Optional
 
 import redis.asyncio as aioredis
+from langgraph.graph import StateGraph, END
 
-from agents.base import initial_state
+from agents.base import ImmuneState, initial_state
 from agents.sentinel import sentinel_node
 from agents.investigator import investigator_node
 from agents.healer import healer_node
@@ -33,45 +34,64 @@ _active_responses: dict[str, dict] = {}
 # Routing logic
 # ─────────────────────────────────────────────
 
-def _needs_healing(state: dict) -> bool:
-    return state.get("requires_healing", True) or state["attack_type"] in ("sql_injection", "file_injection")
+def _needs_healing(state: ImmuneState) -> bool:
+    return state.get("requires_healing", True) or state.get("attack_type") in ("sql_injection", "file_injection")
 
 
-def _needs_hunting(state: dict) -> bool:
-    return state.get("requires_hunting", False) or state["attack_type"] in (
+def _needs_hunting(state: ImmuneState) -> bool:
+    return state.get("requires_hunting", False) or state.get("attack_type") in (
         "port_scan", "sql_injection", "file_injection"
     )
 
 
-# ─────────────────────────────────────────────
-# Pipeline runner
-# ─────────────────────────────────────────────
-
-async def _run_pipeline(state: dict) -> dict:
-    """Execute the sequential immune response pipeline."""
-    # 1. Sentinel — fast containment
-    updates = await sentinel_node(state)
-    state.update(updates)
-
-    # 2. Investigator — deep analysis
-    updates = await investigator_node(state)
-    state.update(updates)
-
-    # 3. Healer — repair (if structural damage occurred)
+def _route_after_investigator(state: ImmuneState) -> str:
+    """Conditional edge: decide which node runs after the investigator."""
     if _needs_healing(state):
-        updates = await healer_node(state)
-        state.update(updates)
-
-    # 4. Hunter — active hunt for related threats
+        return "healer"
     if _needs_hunting(state):
-        updates = await hunter_node(state)
-        state.update(updates)
+        return "hunter"
+    return "memory_agent"
 
-    # 5. Memory Agent — learn and adapt (always runs)
-    updates = await memory_agent_node(state)
-    state.update(updates)
 
-    return state
+def _route_after_healer(state: ImmuneState) -> str:
+    """Conditional edge: after healing, only hunt if needed."""
+    if _needs_hunting(state):
+        return "hunter"
+    return "memory_agent"
+
+
+# ─────────────────────────────────────────────
+# LangGraph pipeline
+# ─────────────────────────────────────────────
+
+def _build_graph() -> StateGraph:
+    graph = StateGraph(ImmuneState)
+
+    graph.add_node("sentinel", sentinel_node)
+    graph.add_node("investigator", investigator_node)
+    graph.add_node("healer", healer_node)
+    graph.add_node("hunter", hunter_node)
+    graph.add_node("memory_agent", memory_agent_node)
+
+    graph.set_entry_point("sentinel")
+    graph.add_edge("sentinel", "investigator")
+    graph.add_conditional_edges(
+        "investigator",
+        _route_after_investigator,
+        {"healer": "healer", "hunter": "hunter", "memory_agent": "memory_agent"},
+    )
+    graph.add_conditional_edges(
+        "healer",
+        _route_after_healer,
+        {"hunter": "hunter", "memory_agent": "memory_agent"},
+    )
+    graph.add_edge("hunter", "memory_agent")
+    graph.add_edge("memory_agent", END)
+
+    return graph.compile()
+
+
+_immune_graph = _build_graph()
 
 
 # ─────────────────────────────────────────────
@@ -112,7 +132,7 @@ async def process_threat(event: dict):
             f"{enriched.get('event_type')} | known={enriched.get('known_attack')}"
         )
 
-        final_state = await _run_pipeline(state)
+        final_state = await _immune_graph.ainvoke(state)
 
         _active_responses[threat_id]["status"] = "resolved"
         _active_responses[threat_id]["event_id"] = db_event.id
